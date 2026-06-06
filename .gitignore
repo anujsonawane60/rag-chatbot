@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+uploaded_files/
+chat_history/

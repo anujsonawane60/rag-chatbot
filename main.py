@@ -7,8 +7,9 @@ from fastapi.staticfiles import StaticFiles
 import cohere
 from pinecone import Pinecone, ServerlessSpec
 import uvicorn
-import PyPDF2
+from pypdf import PdfReader
 import io
+import asyncio
 import docx
 import re
 import tempfile
@@ -24,10 +25,11 @@ load_dotenv()
 # Initialize FastAPI app
 app = FastAPI(title="Multi-RAG Chatbot API")
 
-# Add CORS middleware
+# Add CORS middleware (frontend is served from the same origin;
+# add your deployed domain here when hosting the UI elsewhere)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -211,7 +213,8 @@ class ServiceManager:
                     )
                 )
                 # Wait for index to be ready
-                time.sleep(20)
+                while not self.pinecone_client.describe_index(index_name).status['ready']:
+                    time.sleep(1)
             
             # Initialize index
             self.index = self.pinecone_client.Index(index_name)
@@ -229,10 +232,10 @@ class TextProcessor:
     @staticmethod
     def extract_text_from_pdf(file_bytes):
         try:
-            pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+            pdf_reader = PdfReader(io.BytesIO(file_bytes))
             text = ""
             for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
+                text += (page.extract_text() or "") + "\n"
             return text.strip()
         except Exception as e:
             print(f"PDF extraction error: {str(e)}")
@@ -298,7 +301,7 @@ async def create_chatbot(request: Request):
                 content={"status": "error", "message": "Chatbot name is required"}
             )
         
-        result = chatbot_manager.create_chatbot(chatbot_name)
+        result = await asyncio.to_thread(chatbot_manager.create_chatbot, chatbot_name)
         return JSONResponse(content=result)
         
     except HTTPException as he:
@@ -314,7 +317,7 @@ async def create_chatbot(request: Request):
 
 @app.delete("/chatbot/{chatbot_name}")
 async def delete_chatbot(chatbot_name: str):
-    return chatbot_manager.delete_chatbot(chatbot_name)
+    return await asyncio.to_thread(chatbot_manager.delete_chatbot, chatbot_name)
 
 @app.post("/chatbot/{chatbot_name}/upload")
 async def upload_file(chatbot_name: str, file: UploadFile = File(...)):
@@ -322,11 +325,16 @@ async def upload_file(chatbot_name: str, file: UploadFile = File(...)):
         raise HTTPException(404, "Chatbot not found")
 
     try:
+        # Sanitize filename to prevent path traversal
+        safe_filename = os.path.basename(file.filename or "").replace("\\", "")
+        if not safe_filename or not re.match(r'^[\w\-. ()]+$', safe_filename):
+            raise HTTPException(400, "Invalid filename. Use only letters, numbers, spaces, dots, hyphens and underscores")
+
         # Validate file size (optional, adjust max_size as needed)
         max_size = 10 * 1024 * 1024  # 10MB
         file_size = 0
         file_content = b''
-        
+
         # Read file in chunks to check size
         while chunk := await file.read(8192):
             file_size += len(chunk)
@@ -335,16 +343,16 @@ async def upload_file(chatbot_name: str, file: UploadFile = File(...)):
                 raise HTTPException(400, "File too large (max 10MB)")
 
         # Save file
-        file_path = os.path.join(chatbot_manager.base_upload_dir, chatbot_name, file.filename)
+        file_path = os.path.join(chatbot_manager.base_upload_dir, chatbot_name, safe_filename)
         with open(file_path, "wb") as buffer:
             buffer.write(file_content)
 
         # Process file
-        if file.filename.lower().endswith('.pdf'):
+        if safe_filename.lower().endswith('.pdf'):
             text = TextProcessor.extract_text_from_pdf(file_content)
-        elif file.filename.lower().endswith('.docx'):
+        elif safe_filename.lower().endswith('.docx'):
             text = TextProcessor.extract_text_from_docx(file_content)
-        elif file.filename.lower().endswith('.txt'):
+        elif safe_filename.lower().endswith('.txt'):
             text = file_content.decode('utf-8')
         else:
             raise HTTPException(400, "Unsupported file format")
@@ -356,36 +364,48 @@ async def upload_file(chatbot_name: str, file: UploadFile = File(...)):
         chunks = TextProcessor.chunk_text(text)
         service_manager = chatbot_manager.chatbots[chatbot_name]["service_manager"]
 
-        vectors_to_upsert = []
-        for i, chunk in enumerate(chunks):
-            if chunk.strip():
-                response = service_manager.cohere_client.embed(
-                    texts=[chunk],
-                    model='embed-english-v3.0',
-                    input_type="search_document"
-                )
-                embedding = response.embeddings[0]
+        def embed_and_upsert():
+            index = service_manager.index
 
-                vectors_to_upsert.append({
-                    'id': f'chunk_{i}_{os.urandom(4).hex()}',
-                    'values': embedding,
-                    'metadata': {'text': chunk}
-                })
+            # Remove vectors from any previous upload of this file (IDs are
+            # prefixed with the filename, so re-uploads don't duplicate chunks)
+            for ids in index.list(prefix=f"{safe_filename}#"):
+                index.delete(ids=list(ids))
 
-        if vectors_to_upsert:
-            service_manager.index.upsert(vectors=vectors_to_upsert)
+            vectors_to_upsert = []
+            for i, chunk in enumerate(chunks):
+                if chunk.strip():
+                    response = service_manager.cohere_client.embed(
+                        texts=[chunk],
+                        model='embed-english-v3.0',
+                        input_type="search_document"
+                    )
+                    embedding = response.embeddings[0]
 
-        # Update chatbot files list
-        chatbot_manager.chatbots[chatbot_name]["files"].append(file.filename)
+                    vectors_to_upsert.append({
+                        'id': f'{safe_filename}#chunk_{i}',
+                        'values': embedding,
+                        'metadata': {'text': chunk, 'filename': safe_filename}
+                    })
+
+            if vectors_to_upsert:
+                index.upsert(vectors=vectors_to_upsert)
+            return len(vectors_to_upsert)
+
+        chunks_processed = await asyncio.to_thread(embed_and_upsert)
+
+        # Update chatbot files list (no duplicate entries on re-upload)
+        if safe_filename not in chatbot_manager.chatbots[chatbot_name]["files"]:
+            chatbot_manager.chatbots[chatbot_name]["files"].append(safe_filename)
 
         return JSONResponse(
             content={
                 "status": "success",
-                "message": f"File '{file.filename}' uploaded successfully",
+                "message": f"File '{safe_filename}' uploaded successfully",
                 "details": {
-                    "filename": file.filename,
+                    "filename": safe_filename,
                     "size": file_size,
-                    "chunks_processed": len(vectors_to_upsert),
+                    "chunks_processed": chunks_processed,
                     "text_length": len(text)
                 }
             }
@@ -416,45 +436,47 @@ async def ask_question(chatbot_name: str, request: Request):
 
         service_manager = chatbot_manager.chatbots[chatbot_name]["service_manager"]
 
-        # Generate query embedding
-        response = service_manager.cohere_client.embed(
-            texts=[query],
-            model='embed-english-v3.0',
-            input_type="search_query"
-        )
-        query_embedding = response.embeddings[0]
+        def run_rag():
+            # Generate query embedding
+            response = service_manager.cohere_client.embed(
+                texts=[query],
+                model='embed-english-v3.0',
+                input_type="search_query"
+            )
+            query_embedding = response.embeddings[0]
 
-        # Search in Pinecone
-        search_results = service_manager.index.query(
-            vector=query_embedding,
-            top_k=3,
-            include_metadata=True
-        )
+            # Search in Pinecone
+            search_results = service_manager.index.query(
+                vector=query_embedding,
+                top_k=3,
+                include_metadata=True
+            )
 
-        relevant_chunks = [match['metadata']['text'] for match in search_results['matches']]
-        context = " ".join(relevant_chunks)
+            relevant_chunks = [match['metadata']['text'] for match in search_results['matches']]
+            context = " ".join(relevant_chunks)
 
-        if not context.strip():
-            return {"status": "error", "answer": "No relevant information found"}
+            if not context.strip():
+                return None, relevant_chunks
 
-        # Generate answer
-        prompt = f"""Context: {context}
+            # Generate answer
+            prompt = f"""Context: {context}
 
 Question: {query}
 
-Please provide a clear and concise answer based on the context above."""
+Please provide a clear and concise answer based only on the context above. If the context does not contain the answer, say you don't know."""
 
-        response = service_manager.cohere_client.generate(
-            prompt=prompt,
-            max_tokens=300,
-            temperature=0.7,
-            k=0,
-            stop_sequences=[],
-            return_likelihoods='NONE'
-        )
+            chat_response = service_manager.cohere_client.chat(
+                model="command-a-03-2025",
+                message=prompt,
+                max_tokens=300,
+                temperature=0.3
+            )
+            return chat_response.text.strip(), relevant_chunks
 
-        answer = response.generations[0].text.strip()
-        print("Answer:", answer)
+        answer, relevant_chunks = await asyncio.to_thread(run_rag)
+
+        if answer is None:
+            return {"status": "error", "answer": "No relevant information found"}
 
         # Save to chat history
         chatbot_manager.save_chat_history(chatbot_name, query, answer)
