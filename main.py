@@ -42,7 +42,15 @@ class Config:
     COHERE_API_KEY = os.getenv("COHERE_API_KEY")
     PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
     DIMENSION = 1024
-    CHUNK_SIZE = 500
+    INDEX_NAME = "multi-rag-chatbot"  # one shared index; each chatbot gets its own namespace
+    CHUNK_SIZE = 1500                 # chars (~375 tokens), well under the embed model's 512-token limit
+    CHUNK_OVERLAP = 200               # chars carried across chunk boundaries to preserve context
+    EMBED_BATCH_SIZE = 96             # Cohere embed API max texts per call
+    EMBED_MODEL = "embed-english-v3.0"
+    RERANK_MODEL = "rerank-v3.5"
+    CHAT_MODEL = "command-a-03-2025"
+    RETRIEVE_TOP_K = 20               # wide candidate set for the reranker
+    RERANK_TOP_N = 4                  # final chunks passed to the LLM
 
     @classmethod
     def validate_env_vars(cls):
@@ -52,8 +60,9 @@ class Config:
             raise ValueError("PINECONE_API_KEY not found")
 
 class ChatbotManager:
-    def __init__(self):
+    def __init__(self, service_manager: "ServiceManager"):
         self.chatbots = {}
+        self.service_manager = service_manager
         self.base_upload_dir = "uploaded_files"
         self.chat_history_dir = "chat_history"
         os.makedirs(self.base_upload_dir, exist_ok=True)
@@ -67,16 +76,11 @@ class ChatbotManager:
                     self.initialize_existing_chatbot(chatbot_name)
 
     def initialize_existing_chatbot(self, chatbot_name: str):
-        index_name = f"rag-chatbot-{chatbot_name.lower()}"
-        service_manager = ServiceManager()
-        service_manager.initialize_services(index_name)
-        
         chatbot_dir = os.path.join(self.base_upload_dir, chatbot_name)
         files = os.listdir(chatbot_dir)
-        
+
         self.chatbots[chatbot_name] = {
-            "index_name": index_name,
-            "service_manager": service_manager,
+            "namespace": chatbot_name,
             "files": files,
             "created_date": self.get_creation_date(chatbot_dir)
         }
@@ -86,54 +90,41 @@ class ChatbotManager:
         return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
 
     def create_chatbot(self, chatbot_name: str):
-        try:
-            if not chatbot_name or not re.match("^[a-zA-Z0-9-_]+$", chatbot_name):
-                raise HTTPException(400, "Invalid chatbot name. Use only letters, numbers, hyphens and underscores")
+        if not chatbot_name or not re.match("^[a-zA-Z0-9-_]+$", chatbot_name):
+            raise HTTPException(400, "Invalid chatbot name. Use only letters, numbers, hyphens and underscores")
 
-            if chatbot_name in self.chatbots:
-                raise HTTPException(400, "Chatbot with this name already exists")
+        if chatbot_name in self.chatbots:
+            raise HTTPException(400, "Chatbot with this name already exists")
 
-            chatbot_dir = os.path.join(self.base_upload_dir, chatbot_name)
-            os.makedirs(chatbot_dir, exist_ok=True)
+        chatbot_dir = os.path.join(self.base_upload_dir, chatbot_name)
+        os.makedirs(chatbot_dir, exist_ok=True)
 
-            index_name = f"rag-chatbot-{chatbot_name.lower()}"[:62]
-            service_manager = ServiceManager()
-            
-            try:
-                service_manager.initialize_services(index_name)
-            except Exception as e:
-                if os.path.exists(chatbot_dir):
-                    shutil.rmtree(chatbot_dir)
-                raise HTTPException(500, f"Failed to initialize services: {str(e)}")
+        # No per-chatbot index anymore — vectors live in a namespace of the
+        # shared index, which is created lazily on the first upsert
+        self.chatbots[chatbot_name] = {
+            "namespace": chatbot_name,
+            "files": [],
+            "created_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
 
-            self.chatbots[chatbot_name] = {
-                "index_name": index_name,
-                "service_manager": service_manager,
-                "files": [],
-                "created_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-
-            return {
-                "status": "success",
-                "message": f"Chatbot '{chatbot_name}' created successfully",
-                "name": chatbot_name
-            }
-        except Exception as e:
-            chatbot_dir = os.path.join(self.base_upload_dir, chatbot_name)
-            if os.path.exists(chatbot_dir):
-                shutil.rmtree(chatbot_dir)
-            if chatbot_name in self.chatbots:
-                del self.chatbots[chatbot_name]
-            raise HTTPException(500, f"Error creating chatbot: {str(e)}")
+        return {
+            "status": "success",
+            "message": f"Chatbot '{chatbot_name}' created successfully",
+            "name": chatbot_name
+        }
 
     def delete_chatbot(self, chatbot_name: str):
         if chatbot_name not in self.chatbots:
             raise HTTPException(404, "Chatbot not found")
 
-        service_manager = self.chatbots[chatbot_name]["service_manager"]
-        service_manager.pinecone_client.delete_index(
-            self.chatbots[chatbot_name]["index_name"]
-        )
+        # Remove this chatbot's vectors (its namespace in the shared index)
+        try:
+            self.service_manager.index.delete(
+                delete_all=True,
+                namespace=self.chatbots[chatbot_name]["namespace"]
+            )
+        except Exception:
+            pass  # namespace doesn't exist until the first upload
 
         chatbot_dir = os.path.join(self.base_upload_dir, chatbot_name)
         if os.path.exists(chatbot_dir):
@@ -254,27 +245,51 @@ class TextProcessor:
             return ""
 
     @staticmethod
-    def chunk_text(text, chunk_size=Config.CHUNK_SIZE):
-        sentences = re.split(r'(?<=[.!?]) +', text)
-        chunks = []
-        current_chunk = ""
+    def chunk_text(text, chunk_size=Config.CHUNK_SIZE, overlap=Config.CHUNK_OVERLAP):
+        sentences = re.split(r'(?<=[.!?])\s+', text)
 
+        # Hard-split any single sentence longer than chunk_size so no chunk
+        # exceeds the embedding model's context window
+        split_sentences = []
         for sentence in sentences:
-            if len(current_chunk) + len(sentence) < chunk_size:
-                current_chunk += " " + sentence
-            else:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                current_chunk = sentence
+            while len(sentence) > chunk_size:
+                split_sentences.append(sentence[:chunk_size])
+                sentence = sentence[chunk_size:]
+            if sentence:
+                split_sentences.append(sentence)
 
-        if current_chunk:
-            chunks.append(current_chunk.strip())
+        chunks = []
+        current = []
+        current_len = 0
+
+        for sentence in split_sentences:
+            if current and current_len + len(sentence) > chunk_size:
+                chunks.append(" ".join(current).strip())
+                # Carry trailing sentences forward as overlap so context
+                # isn't lost at chunk boundaries
+                tail = []
+                tail_len = 0
+                for s in reversed(current):
+                    if tail_len + len(s) > overlap:
+                        break
+                    tail.insert(0, s)
+                    tail_len += len(s) + 1
+                current = tail
+                current_len = tail_len
+            current.append(sentence)
+            current_len += len(sentence) + 1
+
+        if current:
+            chunks.append(" ".join(current).strip())
 
         return [chunk for chunk in chunks if chunk.strip()]
 
-# Initialize managers
+# Initialize managers — one shared index for all chatbots (namespaces keep
+# them separated and avoid Pinecone's free-tier index limit)
 Config.validate_env_vars()
-chatbot_manager = ChatbotManager()
+service_manager = ServiceManager()
+service_manager.initialize_services(Config.INDEX_NAME)
+chatbot_manager = ChatbotManager(service_manager)
 
 # API Routes
 @app.get("/", response_class=HTMLResponse)
@@ -362,34 +377,50 @@ async def upload_file(chatbot_name: str, file: UploadFile = File(...)):
 
         # Process chunks
         chunks = TextProcessor.chunk_text(text)
-        service_manager = chatbot_manager.chatbots[chatbot_name]["service_manager"]
+        service_manager = chatbot_manager.service_manager
+        namespace = chatbot_manager.chatbots[chatbot_name]["namespace"]
 
         def embed_and_upsert():
             index = service_manager.index
 
             # Remove vectors from any previous upload of this file (IDs are
             # prefixed with the filename, so re-uploads don't duplicate chunks)
-            for ids in index.list(prefix=f"{safe_filename}#"):
-                index.delete(ids=list(ids))
+            try:
+                for ids in index.list(prefix=f"{safe_filename}#", namespace=namespace):
+                    index.delete(ids=list(ids), namespace=namespace)
+            except Exception:
+                pass  # namespace doesn't exist until the first upload
 
-            vectors_to_upsert = []
-            for i, chunk in enumerate(chunks):
-                if chunk.strip():
-                    response = service_manager.cohere_client.embed(
-                        texts=[chunk],
-                        model='embed-english-v3.0',
-                        input_type="search_document"
-                    )
-                    embedding = response.embeddings[0]
+            # Embed in batches instead of one API call per chunk
+            embeddings = []
+            for start in range(0, len(chunks), Config.EMBED_BATCH_SIZE):
+                batch = chunks[start:start + Config.EMBED_BATCH_SIZE]
+                response = service_manager.cohere_client.embed(
+                    texts=batch,
+                    model=Config.EMBED_MODEL,
+                    input_type="search_document"
+                )
+                embeddings.extend(response.embeddings)
 
-                    vectors_to_upsert.append({
-                        'id': f'{safe_filename}#chunk_{i}',
-                        'values': embedding,
-                        'metadata': {'text': chunk, 'filename': safe_filename}
-                    })
+            vectors_to_upsert = [
+                {
+                    'id': f'{safe_filename}#chunk_{i}',
+                    'values': embedding,
+                    'metadata': {
+                        'text': chunk,
+                        'filename': safe_filename,
+                        'chunk_index': i
+                    }
+                }
+                for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
+            ]
 
-            if vectors_to_upsert:
-                index.upsert(vectors=vectors_to_upsert)
+            # Upsert in batches to stay under Pinecone's request size limit
+            for start in range(0, len(vectors_to_upsert), 100):
+                index.upsert(
+                    vectors=vectors_to_upsert[start:start + 100],
+                    namespace=namespace
+                )
             return len(vectors_to_upsert)
 
         chunks_processed = await asyncio.to_thread(embed_and_upsert)
@@ -434,49 +465,75 @@ async def ask_question(chatbot_name: str, request: Request):
         if not query:
             raise HTTPException(400, "Query required")
 
-        service_manager = chatbot_manager.chatbots[chatbot_name]["service_manager"]
+        service_manager = chatbot_manager.service_manager
+        namespace = chatbot_manager.chatbots[chatbot_name]["namespace"]
 
         def run_rag():
             # Generate query embedding
             response = service_manager.cohere_client.embed(
                 texts=[query],
-                model='embed-english-v3.0',
+                model=Config.EMBED_MODEL,
                 input_type="search_query"
             )
             query_embedding = response.embeddings[0]
 
-            # Search in Pinecone
+            # Retrieve a wide candidate set, then rerank down to the best few
             search_results = service_manager.index.query(
                 vector=query_embedding,
-                top_k=3,
-                include_metadata=True
+                top_k=Config.RETRIEVE_TOP_K,
+                include_metadata=True,
+                namespace=namespace
             )
 
-            relevant_chunks = [match['metadata']['text'] for match in search_results['matches']]
-            context = " ".join(relevant_chunks)
+            matches = search_results['matches']
+            if not matches:
+                return None, []
+
+            documents = [match['metadata']['text'] for match in matches]
+            rerank_results = service_manager.cohere_client.rerank(
+                model=Config.RERANK_MODEL,
+                query=query,
+                documents=documents,
+                top_n=min(Config.RERANK_TOP_N, len(documents))
+            )
+
+            sources = [
+                {
+                    "text": documents[r.index],
+                    "filename": matches[r.index]['metadata'].get('filename', 'unknown'),
+                    "relevance": round(r.relevance_score, 3)
+                }
+                for r in rerank_results.results
+            ]
+
+            context = "\n\n".join(
+                f"[Source: {s['filename']}]\n{s['text']}" for s in sources
+            )
 
             if not context.strip():
-                return None, relevant_chunks
+                return None, []
 
             # Generate answer
-            prompt = f"""Context: {context}
+            prompt = f"""Context:
+{context}
 
 Question: {query}
 
-Please provide a clear and concise answer based only on the context above. If the context does not contain the answer, say you don't know."""
+Please provide a clear and concise answer based only on the context above, mentioning which source file the answer comes from. If the context does not contain the answer, say you don't know."""
 
             chat_response = service_manager.cohere_client.chat(
-                model="command-a-03-2025",
+                model=Config.CHAT_MODEL,
                 message=prompt,
                 max_tokens=300,
                 temperature=0.3
             )
-            return chat_response.text.strip(), relevant_chunks
+            return chat_response.text.strip(), sources
 
-        answer, relevant_chunks = await asyncio.to_thread(run_rag)
+        answer, sources = await asyncio.to_thread(run_rag)
 
         if answer is None:
             return {"status": "error", "answer": "No relevant information found"}
+        relevant_chunks = [s["text"] for s in sources]
 
         # Save to chat history
         chatbot_manager.save_chat_history(chatbot_name, query, answer)
@@ -484,7 +541,8 @@ Please provide a clear and concise answer based only on the context above. If th
         return {
             "status": "success",
             "answer": answer,
-            "context": relevant_chunks
+            "context": relevant_chunks,
+            "sources": sources
         }
 
     except Exception as e:

@@ -12,7 +12,7 @@
 
 ---
 
-## Tier 1 — Correctness & Security (do first)
+## Tier 1 — Correctness & Security (do first) — ✅ DONE (commit `3253343`)
 
 ### 1.1 Missing `static/` directory (startup crash)
 - `main.py:37` mounts `StaticFiles(directory="static")` and `main.py:279` reads `static/index.html`, but `index.html` sits in the repo root and `static/` doesn't exist. FastAPI raises an error at startup.
@@ -54,25 +54,26 @@
 
 ## Tier 2 — Retrieval Quality (what makes RAG actually good)
 
-### 2.1 Chunking with overlap
+### 2.1 Chunking with overlap — ✅ done
 - 500 chars with no overlap loses context at chunk boundaries.
 - **Fix:** ~512–1024 tokens per chunk with 10–20% overlap, or semantic/recursive chunking.
 
-### 2.2 Batch embeddings
+### 2.2 Batch embeddings — ✅ done
 - The embed API is called once *per chunk* (`main.py:360-367`); Cohere accepts up to 96 texts per call.
 - **Fix:** batch the chunks — uploads become ~50× faster and cheaper.
 
-### 2.3 Reranking
+### 2.3 Reranking — ✅ done
 - Retrieve top-20–50 candidates, then rerank to top-3–5 (Cohere Rerank API).
 - Single biggest retrieval-quality lift available.
 
-### 2.4 Hybrid search
+### 2.4 Hybrid search — ⏸ deferred
 - Combine dense vectors with keyword/BM25 (Pinecone sparse-dense) so exact terms like product codes and names still match.
+- Deferred: sparse-dense requires a `dotproduct`-metric index (current index is `cosine`) plus the `pinecone-text` BM25 encoder. Reranking (2.3) captures most of this lift; revisit if exact-term queries underperform.
 
-### 2.5 Richer metadata + citations
+### 2.5 Richer metadata + citations — ✅ done (API returns `sources`; showing them in the UI is Tier 3)
 - Store filename, page number, and chunk position so answers can cite sources. The API already returns `context` but the UI never shows it.
 
-### 2.6 One index + namespaces instead of one index per chatbot
+### 2.6 One index + namespaces instead of one index per chatbot — ✅ done
 - Pinecone's free tier caps at 5 indexes; namespaces scale to thousands of chatbots and avoid the 20-second index-creation wait (`main.py:214`).
 
 ---
